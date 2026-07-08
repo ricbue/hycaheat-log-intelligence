@@ -47,16 +47,49 @@ def get_logs(service_name, lookback_hours=24, start_from=None):
             start_time = (datetime.now(timezone.utc) - timedelta(hours=lookback_hours))
     else:
         start_time = (datetime.now(timezone.utc) - timedelta(hours=lookback_hours))
-    
-    filter_str = f'resource.type="cloud_run_revision" AND resource.labels.service_name="{service_name}" AND timestamp >= "{start_time.strftime("%Y-%m-%dT%H:%M:%SZ")}"'
-    entries = client.list_entries(filter_=filter_str, max_results=500)
-    
+
+    # logName restricted to request logs: without it the query also returns
+    # container stdout/stderr lines, which have no httpRequest and show up
+    # as bogus null-status entries (50 % of the first report's sample).
+    filter_str = (
+        f'resource.type="cloud_run_revision" AND resource.labels.service_name="{service_name}" '
+        f'AND logName:"logs/run.googleapis.com%2Frequests" '
+        f'AND timestamp >= "{start_time.strftime("%Y-%m-%dT%H:%M:%SZ")}"'
+    )
+    # DESCENDING + reverse: with the default ascending order, max_results
+    # returns the *oldest* entries of the window instead of the newest.
+    entries = client.list_entries(filter_=filter_str, order_by=cloud_logging.DESCENDING, max_results=500)
+
     logs, latest_ts = [], start_from
     for entry in entries:
         ts = entry.timestamp.isoformat() if entry.timestamp else None
         if ts and (not latest_ts or ts > latest_ts): latest_ts = ts
         logs.append({"timestamp": ts, "httpRequest": entry.http_request if entry.http_request else {}, "resource": entry.resource.labels if entry.resource else {}})
+    logs.reverse()  # chronological for archive + prompt
     return logs, latest_ts
+
+def archive_logs(service_name, logs):
+    """Append the batch to the raw-log archive: gs://<bucket>/logs/<service>/YYYY/MM/DD/HHMMSS.jsonl.
+
+    Rotation happens via the bucket lifecycle rule on the logs/ prefix
+    (deploy.sh --setup, default 90 days) — no in-code cleanup needed.
+    """
+    if not logs:
+        return
+    try:
+        now = datetime.now(timezone.utc)
+        path = f"logs/{service_name}/{now.strftime('%Y/%m/%d')}/{now.strftime('%H%M%S')}.jsonl"
+        client = storage.Client(project=PROJECT_ID)
+        bucket = client.lookup_bucket(STATE_BUCKET)
+        if not bucket:
+            bucket = client.create_bucket(STATE_BUCKET, location="europe-west10")
+        bucket.blob(path).upload_from_string(
+            "\n".join(json.dumps(e, default=str) for e in logs),
+            content_type="application/jsonl",
+        )
+        print(f"Archived {len(logs)} entries to gs://{STATE_BUCKET}/{path}")
+    except Exception as e:
+        print(f"Error archiving logs to GCS: {e}")
 
 def preprocess_logs(logs):
     processed = []
@@ -107,31 +140,86 @@ def analyze_with_claude(service_name, processed_logs, stats, service_state, user
         return "TRUE" in parts[1].upper(), parts[2].strip(), parts[3].strip()
     return True, full_text, service_state['baseline_summary']
 
+def answer_chat(state, user_message):
+    """Answer a Google Chat question with ONE Claude call across all services.
+
+    Google Chat expects a synchronous reply within ~30 s; one call per
+    service would blow that budget. Read-only: does not advance the
+    scheduler cursor, archive logs, or rewrite baselines (except appending
+    an explicit standing instruction).
+    """
+    sections = []
+    for service in SERVICES:
+        s_state = state["services"].get(service, {"baseline_summary": "No baseline established yet.", "human_instructions": ""})
+        logs, _ = get_logs(service, lookback_hours=24)
+        processed, stats = preprocess_logs(logs)
+        sections.append(
+            f"### Service: {service}\n"
+            f"BASELINE: {s_state['baseline_summary']}\n"
+            f"STANDING INSTRUCTIONS: {s_state.get('human_instructions') or 'None'}\n"
+            f"STATS: {json.dumps(stats)}\n"
+            f"INTERESTING LOGS (bots & errors): {json.dumps(processed[:60])}"
+        )
+
+    prompt = (
+        "You are LogBot, the log-analysis assistant for hycaheat.com "
+        "(Cloud Run services behind a GCP load balancer).\n\n"
+        + "\n\n".join(sections)
+        + "\n\nWindow: last 24 hours, up to 500 most recent requests per service."
+        + f"\n\nUSER QUESTION: '{user_message}'\n\n"
+        "Answer the question directly and concisely for a Google Chat message "
+        "(plain text, *bold* allowed, no markdown tables). Only mention services "
+        "relevant to the question. Base claims strictly on the data above; say "
+        "so when the window or sample does not contain the answer."
+    )
+    headers = {"x-api-key": CLAUDE_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
+    data = {"model": "claude-sonnet-5", "max_tokens": 1024, "messages": [{"role": "user", "content": prompt}]}
+    response = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json=data)
+    res_json = response.json()
+    answer = "".join(b["text"] for b in res_json.get("content", []) if b["type"] == "text")
+
+    # Explicit feedback ("ignore ...", "remember ...", "... is normal")
+    # becomes a standing instruction for future scheduled analyses.
+    if any(cmd in user_message.lower() for cmd in ["ignore", "remember", "normal"]):
+        for service in SERVICES:
+            s_state = state["services"].setdefault(service, {"last_timestamp": None, "baseline_summary": "No baseline established yet.", "human_instructions": ""})
+            s_state["human_instructions"] = (s_state.get("human_instructions") or "") + f"\n- {user_message}"
+        save_state(state)
+        answer += "\n\n_(Als dauerhafte Anweisung gespeichert.)_"
+
+    return answer or "Keine Antwort erhalten — bitte noch einmal versuchen."
+
 @functions_framework.http
 def log_intelligence_webhook(request):
     state = load_state()
-    user_message = None
-    if request.method == 'POST':
-        body = request.get_json(silent=True)
-        if body and 'message' in body:
-            user_message = body['message'].get('text')
-    
+    # Chat vs. Scheduler is decided by the payload (a Chat event carries
+    # 'message'), not the HTTP method — Cloud Scheduler also POSTs.
+    body = request.get_json(silent=True) if request.method == 'POST' else None
+    if body and body.get('type') == 'ADDED_TO_SPACE':
+        return json.dumps({"text": "Hi! Ich bin LogBot. Frag mich zu den hycaheat.com-Logs, z. B. \"welche AI-Crawler waren heute da?\" (Fenster: letzte 24 h)."})
+    user_message = body['message'].get('text') if body and 'message' in body else None
+
+    if user_message:
+        try:
+            return json.dumps({"text": answer_chat(state, user_message)})
+        except Exception as e:
+            print(f"Chat answer failed: {e}")
+            return json.dumps({"text": f"Da ging etwas schief: {e}"})
+
+    # Scheduled mode: per-service anomaly check, archive, advance cursor.
     combined_reports = []
     for service in SERVICES:
         s_state = state["services"].get(service, {"last_timestamp": None, "baseline_summary": "No baseline established yet.", "human_instructions": ""})
         logs, latest_ts = get_logs(service, lookback_hours=24, start_from=s_state["last_timestamp"])
-        if not logs and not user_message: continue
+        if not logs: continue
+        archive_logs(service, logs)
         processed, stats = preprocess_logs(logs)
-        is_noteworthy, report, new_baseline = analyze_with_claude(service, processed, stats, s_state, user_message)
+        is_noteworthy, report, new_baseline = analyze_with_claude(service, processed, stats, s_state)
         state["services"][service].update({"last_timestamp": latest_ts, "baseline_summary": new_baseline})
-        if user_message and any(cmd in user_message.lower() for cmd in ["ignore", "remember", "normal"]):
-            state["services"][service]["human_instructions"] += f"\n- {user_message}"
         if is_noteworthy:
             combined_reports.append(f"*Service: {service}*\n{report}")
-    
+
     save_state(state)
     if combined_reports:
-        final_text = "\n\n".join(combined_reports)
-        if request.method == 'POST': return json.dumps({"text": final_text})
-        requests.post(CHAT_WEBHOOK_URL, json={"text": final_text})
+        requests.post(CHAT_WEBHOOK_URL, json={"text": "\n\n".join(combined_reports)})
     return "OK", 200
