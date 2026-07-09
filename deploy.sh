@@ -8,6 +8,9 @@ ENTRY_POINT="log_intelligence_webhook"
 RUNTIME="python311"
 STATE_BUCKET="${STATE_BUCKET:-$PROJECT_ID-log-intelligence-state}"
 LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-90}"
+# Cloud Scheduler is not available in europe-west10 (Berlin); the job's
+# region is irrelevant for an HTTP target, so it lives in Frankfurt.
+SCHEDULER_REGION="${SCHEDULER_REGION:-europe-west3}"
 
 # Secrets come from the environment or a local .env (gitignored) — never
 # hardcode them here; GitHub push protection blocks the push.
@@ -54,11 +57,11 @@ EOF
   if [ -n "$FUNCTION_URL" ]; then
     SCHEDULER_BODY="{\"token\": \"$ANALYZE_TOKEN\"}"
     gcloud scheduler jobs create http log-intelligence-hourly \
-      --project=$PROJECT_ID --location=$REGION \
+      --project=$PROJECT_ID --location=$SCHEDULER_REGION \
       --schedule="0 * * * *" --uri="$FUNCTION_URL" \
       --http-method=POST --message-body="$SCHEDULER_BODY" 2>/dev/null \
       || gcloud scheduler jobs update http log-intelligence-hourly \
-        --project=$PROJECT_ID --location=$REGION \
+        --project=$PROJECT_ID --location=$SCHEDULER_REGION \
         --schedule="0 * * * *" --uri="$FUNCTION_URL" \
         --http-method=POST --message-body="$SCHEDULER_BODY"
   else
@@ -78,6 +81,7 @@ gcloud functions deploy $FUNCTION_NAME \
   --trigger-http \
   --entry-point=$ENTRY_POINT \
   --set-env-vars "CLAUDE_API_KEY=$CLAUDE_API_KEY,CHAT_WEBHOOK_URL=$CHAT_WEBHOOK_URL,STATE_BUCKET=$STATE_BUCKET,CHAT_AUDIENCE=$PROJECT_NUMBER,ANALYZE_TOKEN=$ANALYZE_TOKEN" \
+  --timeout=300 \
   --allow-unauthenticated
 
 echo "✅ Deployment attempt finished."
