@@ -229,7 +229,9 @@ def _verify_chat_request(request):
 def log_intelligence_webhook(request):
     # Chat vs. Scheduler is decided by the payload (a Chat event carries
     # 'message' or 'type'), not the HTTP method — Cloud Scheduler also POSTs.
-    body = request.get_json(silent=True) if request.method == 'POST' else None
+    # force=True: Cloud Scheduler posts the body without a JSON content type;
+    # without force get_json() returns None and the token check 403s the run.
+    body = request.get_json(silent=True, force=True) if request.method == 'POST' else None
     is_chat_event = bool(body) and ('message' in body or 'type' in body)
 
     if is_chat_event and not _verify_chat_request(request):

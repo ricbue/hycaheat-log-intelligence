@@ -59,11 +59,13 @@ EOF
     gcloud scheduler jobs create http log-intelligence-hourly \
       --project=$PROJECT_ID --location=$SCHEDULER_REGION \
       --schedule="0 * * * *" --uri="$FUNCTION_URL" \
-      --http-method=POST --message-body="$SCHEDULER_BODY" 2>/dev/null \
+      --http-method=POST --message-body="$SCHEDULER_BODY" \
+      --headers "Content-Type=application/json" 2>/dev/null \
       || gcloud scheduler jobs update http log-intelligence-hourly \
         --project=$PROJECT_ID --location=$SCHEDULER_REGION \
         --schedule="0 * * * *" --uri="$FUNCTION_URL" \
-        --http-method=POST --message-body="$SCHEDULER_BODY"
+        --http-method=POST --message-body="$SCHEDULER_BODY" \
+        --update-headers "Content-Type=application/json"
   else
     echo "   ⚠️ Function not deployed yet — run ./deploy.sh first, then --setup again."
   fi
