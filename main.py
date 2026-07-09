@@ -227,6 +227,13 @@ def cmd_status(state):
         lines.append(f"- {service}: Cursor {cursor}, {n_instr} Anweisung(en)")
     return "\n".join(lines)
 
+def _norm_cmd_id(raw):
+    """JSON numbers arrive as floats — str(3.0) would never match '3'."""
+    try:
+        return str(int(float(raw)))
+    except (TypeError, ValueError):
+        return str(raw or "")
+
 def parse_chat_event(body):
     """Normalize legacy events (type: MESSAGE, …) and new add-on-style
     events (chat.messagePayload, …) into (kind, text, command_id).
@@ -239,14 +246,14 @@ def parse_chat_event(body):
             return "added", "", None
         if "appCommandPayload" in chat:
             payload = chat["appCommandPayload"]
-            cmd = str(payload.get("appCommandMetadata", {}).get("appCommandId", ""))
+            cmd = _norm_cmd_id(payload.get("appCommandMetadata", {}).get("appCommandId"))
             msg = payload.get("message", {})
             return "command", (msg.get("argumentText") or msg.get("text") or "").strip(), cmd
         if "messagePayload" in chat:
             msg = chat["messagePayload"].get("message", {})
             slash = msg.get("slashCommand")
             if slash:
-                return "command", (msg.get("argumentText") or "").strip(), str(slash.get("commandId", ""))
+                return "command", (msg.get("argumentText") or "").strip(), _norm_cmd_id(slash.get("commandId"))
             return "message", (msg.get("argumentText") or msg.get("text") or "").strip(), None
         return "other", "", None
     # legacy format
@@ -257,7 +264,7 @@ def parse_chat_event(body):
         slash = msg.get("slashCommand")
         text = (msg.get("argumentText") or msg.get("text") or "").strip()
         if slash:
-            return "command", text, str(slash.get("commandId", ""))
+            return "command", text, _norm_cmd_id(slash.get("commandId"))
         return "message", text, None
     return "other", "", None
 
