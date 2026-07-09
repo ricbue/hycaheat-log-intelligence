@@ -18,6 +18,10 @@ if [ -f .env ]; then
 fi
 : "${CLAUDE_API_KEY:?Set CLAUDE_API_KEY in the environment or .env}"
 : "${CHAT_WEBHOOK_URL:?Set CHAT_WEBHOOK_URL in the environment or .env}"
+: "${ANALYZE_TOKEN:?Set ANALYZE_TOKEN in .env (e.g. openssl rand -hex 24) — shared secret for the Scheduler trigger}"
+
+# Chat token audience = project number (Google signs Chat events with it).
+PROJECT_NUMBER=$(gcloud projects describe $PROJECT_ID --format="value(projectNumber)")
 
 # One-time infrastructure: ./deploy.sh --setup
 # Creates the state/archive bucket, the lifecycle rule that rotates the raw
@@ -48,11 +52,15 @@ EOF
   FUNCTION_URL=$(gcloud functions describe $FUNCTION_NAME --project=$PROJECT_ID \
     --region=$REGION --gen2 --format="value(serviceConfig.uri)" 2>/dev/null)
   if [ -n "$FUNCTION_URL" ]; then
+    SCHEDULER_BODY="{\"token\": \"$ANALYZE_TOKEN\"}"
     gcloud scheduler jobs create http log-intelligence-hourly \
       --project=$PROJECT_ID --location=$REGION \
       --schedule="0 * * * *" --uri="$FUNCTION_URL" \
-      --http-method=POST --message-body='{}' 2>/dev/null \
-      || echo "   (Scheduler job exists already — ok)"
+      --http-method=POST --message-body="$SCHEDULER_BODY" 2>/dev/null \
+      || gcloud scheduler jobs update http log-intelligence-hourly \
+        --project=$PROJECT_ID --location=$REGION \
+        --schedule="0 * * * *" --uri="$FUNCTION_URL" \
+        --http-method=POST --message-body="$SCHEDULER_BODY"
   else
     echo "   ⚠️ Function not deployed yet — run ./deploy.sh first, then --setup again."
   fi
@@ -69,7 +77,7 @@ gcloud functions deploy $FUNCTION_NAME \
   --region=$REGION \
   --trigger-http \
   --entry-point=$ENTRY_POINT \
-  --set-env-vars "CLAUDE_API_KEY=$CLAUDE_API_KEY,CHAT_WEBHOOK_URL=$CHAT_WEBHOOK_URL,STATE_BUCKET=$STATE_BUCKET" \
+  --set-env-vars "CLAUDE_API_KEY=$CLAUDE_API_KEY,CHAT_WEBHOOK_URL=$CHAT_WEBHOOK_URL,STATE_BUCKET=$STATE_BUCKET,CHAT_AUDIENCE=$PROJECT_NUMBER,ANALYZE_TOKEN=$ANALYZE_TOKEN" \
   --allow-unauthenticated
 
 echo "✅ Deployment attempt finished."

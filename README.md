@@ -34,8 +34,11 @@ the scripts; GitHub push protection blocks pushes containing keys.
 
 - `CLAUDE_API_KEY` — Anthropic API key
 - `CHAT_WEBHOOK_URL` — Google Chat incoming webhook (scheduled reports)
+- `ANALYZE_TOKEN` — shared secret for the Scheduler trigger (`openssl rand -hex 24`)
 - `STATE_BUCKET` — GCS bucket for state + log archive (default: `<project>-log-intelligence-state`)
 - `LOG_RETENTION_DAYS` — archive rotation, deploy-time only (default 90)
+- `CHAT_AUDIENCE` — set automatically by deploy.sh (project number); enables
+  verification of the Google-signed bearer token on Chat events
 
 ## Google Chat app (interactive bot)
 
@@ -50,11 +53,11 @@ must be registered as a Chat app:
 4. **Visibility**: eigene Domain/Nutzer freigeben, speichern.
 5. Im Chat-Space: Apps hinzufügen → LogBot → mit `@LogBot <Frage>` testen.
 
-⚠️ Prototype caveat: the function is `--allow-unauthenticated` and does not
-verify Google Chat bearer tokens — anyone with the URL can query log summaries
-and spend Claude tokens. For hardening, verify the `Authorization: Bearer`
-token against issuer `chat@system.gserviceaccount.com` (audience = project
-number) and put a shared secret on the Scheduler payload.
+The endpoint is `--allow-unauthenticated` at the HTTP level, but hardened in
+code: Chat events must carry a valid Google-signed bearer token (issuer
+`chat@system.gserviceaccount.com`, audience = project number via
+`CHAT_AUDIENCE`), and the Scheduler trigger must send the shared
+`ANALYZE_TOKEN`. Requests without either are rejected (401/403).
 
 ## Local usage
 

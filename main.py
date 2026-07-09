@@ -2,8 +2,10 @@ import os
 import json
 from datetime import datetime, timedelta, timezone
 import requests
+from google.auth.transport import requests as google_auth_requests
 from google.cloud import logging as cloud_logging
 from google.cloud import storage
+from google.oauth2 import id_token
 import functions_framework
 
 # Configuration
@@ -12,6 +14,15 @@ CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY")
 CHAT_WEBHOOK_URL = os.getenv("CHAT_WEBHOOK_URL")
 STATE_BUCKET = os.getenv("STATE_BUCKET", f"{PROJECT_ID}-log-intelligence-state")
 STATE_FILE = "intelligence_state.json"
+# Project *number* — audience of the Google-signed bearer token on Chat
+# events. Unset = verification skipped (local testing only).
+CHAT_AUDIENCE = os.getenv("CHAT_AUDIENCE")
+# Shared secret the Cloud Scheduler job sends as {"token": ...}; the
+# function endpoint itself is public (--allow-unauthenticated).
+ANALYZE_TOKEN = os.getenv("ANALYZE_TOKEN")
+
+CHAT_ISSUER = "chat@system.gserviceaccount.com"
+CHAT_CERTS_URL = f"https://www.googleapis.com/service_accounts/v1/metadata/x509/{CHAT_ISSUER}"
 
 SERVICES = ["hycaheat-website-prod", "hycaheat-configurator-prod", "tco-frontend-prod", "tco-backend-prod"]
 LLM_BOTS = ["GPTBot", "ClaudeBot", "Googlebot", "CCBot", "PerplexityBot", "OAI-SearchBot", "Applebot", "Bytespider"]
@@ -189,12 +200,44 @@ def answer_chat(state, user_message):
 
     return answer or "Keine Antwort erhalten — bitte noch einmal versuchen."
 
+def _verify_chat_request(request):
+    """Verify the Google-signed bearer token that Chat sends with every event.
+
+    Audience is the project number, issuer chat@system.gserviceaccount.com.
+    Without this check anyone who finds the public function URL could pose
+    as Chat, query log summaries and burn Claude tokens.
+    """
+    if not CHAT_AUDIENCE:
+        print("WARNING: CHAT_AUDIENCE not set — skipping Chat token verification.")
+        return True
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return False
+    try:
+        claims = id_token.verify_token(
+            auth[len("Bearer "):],
+            google_auth_requests.Request(),
+            audience=CHAT_AUDIENCE,
+            certs_url=CHAT_CERTS_URL,
+        )
+        return claims.get("iss") == CHAT_ISSUER or claims.get("email") == CHAT_ISSUER
+    except Exception as e:
+        print(f"Chat token verification failed: {e}")
+        return False
+
 @functions_framework.http
 def log_intelligence_webhook(request):
-    state = load_state()
     # Chat vs. Scheduler is decided by the payload (a Chat event carries
-    # 'message'), not the HTTP method — Cloud Scheduler also POSTs.
+    # 'message' or 'type'), not the HTTP method — Cloud Scheduler also POSTs.
     body = request.get_json(silent=True) if request.method == 'POST' else None
+    is_chat_event = bool(body) and ('message' in body or 'type' in body)
+
+    if is_chat_event and not _verify_chat_request(request):
+        return json.dumps({"text": "unauthorized"}), 401
+    if not is_chat_event and ANALYZE_TOKEN and (body or {}).get('token') != ANALYZE_TOKEN:
+        return "forbidden", 403
+
+    state = load_state()
     if body and body.get('type') == 'ADDED_TO_SPACE':
         return json.dumps({"text": "Hi! Ich bin LogBot. Frag mich zu den hycaheat.com-Logs, z. B. \"welche AI-Crawler waren heute da?\" (Fenster: letzte 24 h)."})
     user_message = body['message'].get('text') if body and 'message' in body else None
