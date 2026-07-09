@@ -9,8 +9,10 @@ questions about the logs.
 - **LLM bot tracking:** GPTBot, ClaudeBot, PerplexityBot, Googlebot, …
 - **Chat with your logs:** mention the bot in Google Chat ("welche AI-Crawler
   waren heute da?") — answers from the last 24 h of request logs.
-- **Standing instructions:** messages containing "ignore", "remember" or
-  "normal" are stored and injected into future scheduled analyses.
+- **Slash commands** (everything else is treated as a chat question):
+  `/remember <text>` stores a standing instruction for future analyses,
+  `/analyze` triggers the Scheduler job (report arrives via webhook),
+  `/status` shows cursors and instruction counts without a Claude call.
 - **Scheduled anomaly reports:** hourly Cloud Scheduler run per service;
   posts to Google Chat only when noteworthy.
 - **Raw-log archive with rotation:** every scheduled run appends the batch as
@@ -51,7 +53,19 @@ must be registered as a Chat app:
    (`gcloud functions describe log-intelligence --gen2 --region=europe-west10
    --format="value(serviceConfig.uri)"`).
 4. **Visibility**: eigene Domain/Nutzer freigeben, speichern.
-5. Im Chat-Space: Apps hinzufügen → LogBot → mit `@LogBot <Frage>` testen.
+5. **Commands** (im Abschnitt "Commands"/"Slash commands" der Konfiguration) —
+   die IDs müssen zu `main.py` (CMD_*) passen:
+   | ID | Name | Beschreibung |
+   |---|---|---|
+   | 1 | `/remember` | Dauerhafte Anweisung für die Analysen speichern |
+   | 2 | `/analyze` | Analyse-Lauf sofort starten (Bericht kommt per Webhook) |
+   | 3 | `/status` | Cursor & Anweisungen pro Service anzeigen |
+6. Im Chat-Space: Apps hinzufügen → LogBot → mit `@LogBot <Frage>` testen.
+
+Die Function versteht beide Event-Formate: das Legacy-Format (`type:
+MESSAGE`) und das neue Add-on-Format (`chat.messagePayload` /
+`chat.appCommandPayload`), das die aktuelle Console-Konfiguration
+("common HTTP endpoint URL" bzw. per-Trigger-URLs) sendet.
 
 The endpoint is `--allow-unauthenticated` at the HTTP level, but hardened in
 code: Chat events must carry a valid Google-signed bearer token (issuer

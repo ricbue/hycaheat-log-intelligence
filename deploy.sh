@@ -69,6 +69,12 @@ EOF
   else
     echo "   ⚠️ Function not deployed yet — run ./deploy.sh first, then --setup again."
   fi
+  echo "🔑 Allowing the function's service account to run the job (/analyze command)..."
+  gcloud projects add-iam-policy-binding $PROJECT_ID \
+    --member="serviceAccount:$PROJECT_NUMBER-compute@developer.gserviceaccount.com" \
+    --role="roles/cloudscheduler.jobRunner" --condition=None --quiet >/dev/null \
+    && echo "   ok" || echo "   ⚠️ IAM binding failed — /analyze will not work."
+
   echo "✅ Setup finished."
   exit 0
 fi
@@ -82,7 +88,7 @@ gcloud functions deploy $FUNCTION_NAME \
   --region=$REGION \
   --trigger-http \
   --entry-point=$ENTRY_POINT \
-  --set-env-vars "CLAUDE_API_KEY=$CLAUDE_API_KEY,CHAT_WEBHOOK_URL=$CHAT_WEBHOOK_URL,STATE_BUCKET=$STATE_BUCKET,CHAT_AUDIENCE=$PROJECT_NUMBER,ANALYZE_TOKEN=$ANALYZE_TOKEN" \
+  --set-env-vars "CLAUDE_API_KEY=$CLAUDE_API_KEY,CHAT_WEBHOOK_URL=$CHAT_WEBHOOK_URL,STATE_BUCKET=$STATE_BUCKET,CHAT_AUDIENCE=$PROJECT_NUMBER,ANALYZE_TOKEN=$ANALYZE_TOKEN,ANALYZE_JOB=projects/$PROJECT_ID/locations/$SCHEDULER_REGION/jobs/log-intelligence-hourly" \
   --timeout=300 \
   --allow-unauthenticated
 

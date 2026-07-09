@@ -20,6 +20,8 @@ CHAT_AUDIENCE = os.getenv("CHAT_AUDIENCE")
 # Shared secret the Cloud Scheduler job sends as {"token": ...}; the
 # function endpoint itself is public (--allow-unauthenticated).
 ANALYZE_TOKEN = os.getenv("ANALYZE_TOKEN")
+# Full resource name of the hourly Scheduler job; /analyze triggers it.
+ANALYZE_JOB = os.getenv("ANALYZE_JOB", f"projects/{PROJECT_ID}/locations/europe-west3/jobs/log-intelligence-hourly")
 
 CHAT_ISSUER = "chat@system.gserviceaccount.com"
 CHAT_CERTS_URL = f"https://www.googleapis.com/service_accounts/v1/metadata/x509/{CHAT_ISSUER}"
@@ -188,17 +190,82 @@ def answer_chat(state, user_message):
     response = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json=data)
     res_json = response.json()
     answer = "".join(b["text"] for b in res_json.get("content", []) if b["type"] == "text")
-
-    # Explicit feedback ("ignore ...", "remember ...", "... is normal")
-    # becomes a standing instruction for future scheduled analyses.
-    if any(cmd in user_message.lower() for cmd in ["ignore", "remember", "normal"]):
-        for service in SERVICES:
-            s_state = state["services"].setdefault(service, {"last_timestamp": None, "baseline_summary": "No baseline established yet.", "human_instructions": ""})
-            s_state["human_instructions"] = (s_state.get("human_instructions") or "") + f"\n- {user_message}"
-        save_state(state)
-        answer += "\n\n_(Als dauerhafte Anweisung gespeichert.)_"
-
     return answer or "Keine Antwort erhalten — bitte noch einmal versuchen."
+
+# Slash commands — IDs must match the command configuration in the
+# Google Chat API console. Everything else is treated as a chat question.
+CMD_REMEMBER, CMD_ANALYZE, CMD_STATUS = "1", "2", "3"
+
+def cmd_remember(state, args):
+    if not args:
+        return "Nutzung: /remember <Anweisung>, z. B. /remember 404s auf /apple-touch-icon* sind normal."
+    for service in SERVICES:
+        s_state = state["services"].setdefault(service, {"last_timestamp": None, "baseline_summary": "No baseline established yet.", "human_instructions": ""})
+        s_state["human_instructions"] = (s_state.get("human_instructions") or "") + f"\n- {args}"
+    save_state(state)
+    return f"Gespeichert als dauerhafte Anweisung für alle Analysen:\n_{args}_"
+
+def cmd_analyze():
+    """Kick off the hourly Scheduler job instead of analyzing inline —
+    a full run takes ~100 s, far beyond Chat's ~30 s reply window.
+    The report arrives in the space via the incoming webhook."""
+    try:
+        from google.cloud import scheduler_v1
+        scheduler_v1.CloudSchedulerClient().run_job(name=ANALYZE_JOB)
+        return "Analyse gestartet — der Bericht kommt in ~2 Minuten in den Space (falls es Auffälligkeiten gibt)."
+    except Exception as e:
+        print(f"cmd_analyze failed: {e}")
+        return f"Konnte den Analyse-Job nicht starten: {e}"
+
+def cmd_status(state):
+    """Quick state dump without a Claude call."""
+    lines = ["*LogBot-Status*"]
+    for service in SERVICES:
+        s = state["services"].get(service, {})
+        cursor = s.get("last_timestamp") or "nie"
+        n_instr = len([l for l in (s.get("human_instructions") or "").splitlines() if l.strip()])
+        lines.append(f"- {service}: Cursor {cursor}, {n_instr} Anweisung(en)")
+    return "\n".join(lines)
+
+def parse_chat_event(body):
+    """Normalize legacy events (type: MESSAGE, …) and new add-on-style
+    events (chat.messagePayload, …) into (kind, text, command_id).
+
+    kind: 'added' | 'message' | 'command' | 'other'
+    """
+    chat = body.get("chat")
+    if chat is not None:  # new add-on format (per-trigger / common URL config)
+        if "addedToSpacePayload" in chat:
+            return "added", "", None
+        if "appCommandPayload" in chat:
+            payload = chat["appCommandPayload"]
+            cmd = str(payload.get("appCommandMetadata", {}).get("appCommandId", ""))
+            msg = payload.get("message", {})
+            return "command", (msg.get("argumentText") or msg.get("text") or "").strip(), cmd
+        if "messagePayload" in chat:
+            msg = chat["messagePayload"].get("message", {})
+            slash = msg.get("slashCommand")
+            if slash:
+                return "command", (msg.get("argumentText") or "").strip(), str(slash.get("commandId", ""))
+            return "message", (msg.get("argumentText") or msg.get("text") or "").strip(), None
+        return "other", "", None
+    # legacy format
+    if body.get("type") == "ADDED_TO_SPACE":
+        return "added", "", None
+    if "message" in body:
+        msg = body["message"]
+        slash = msg.get("slashCommand")
+        text = (msg.get("argumentText") or msg.get("text") or "").strip()
+        if slash:
+            return "command", text, str(slash.get("commandId", ""))
+        return "message", text, None
+    return "other", "", None
+
+def chat_reply(body, text):
+    """Build the synchronous reply in the format matching the event."""
+    if body.get("chat") is not None:
+        return json.dumps({"hostAppDataAction": {"chatDataAction": {"createMessageAction": {"message": {"text": text}}}}})
+    return json.dumps({"text": text})
 
 def _verify_chat_request(request):
     """Verify the Google-signed bearer token that Chat sends with every event.
@@ -232,25 +299,35 @@ def log_intelligence_webhook(request):
     # force=True: Cloud Scheduler posts the body without a JSON content type;
     # without force get_json() returns None and the token check 403s the run.
     body = request.get_json(silent=True, force=True) if request.method == 'POST' else None
-    is_chat_event = bool(body) and ('message' in body or 'type' in body)
+    is_chat_event = bool(body) and ('message' in body or 'type' in body or 'chat' in body)
 
     if is_chat_event and not _verify_chat_request(request):
         return json.dumps({"text": "unauthorized"}), 401
     if not is_chat_event and ANALYZE_TOKEN and (body or {}).get('token') != ANALYZE_TOKEN:
         return "forbidden", 403
 
-    state = load_state()
-    if body and body.get('type') == 'ADDED_TO_SPACE':
-        return json.dumps({"text": "Hi! Ich bin LogBot. Frag mich zu den hycaheat.com-Logs, z. B. \"welche AI-Crawler waren heute da?\" (Fenster: letzte 24 h)."})
-    user_message = body['message'].get('text') if body and 'message' in body else None
-
-    if user_message:
+    if is_chat_event:
+        state = load_state()
+        kind, text, command_id = parse_chat_event(body)
         try:
-            return json.dumps({"text": answer_chat(state, user_message)})
+            if kind == "added":
+                return chat_reply(body, "Hi! Ich bin LogBot. Frag mich zu den hycaheat.com-Logs, z. B. \"welche AI-Crawler waren heute da?\" (Fenster: letzte 24 h). Commands: /remember, /analyze, /status.")
+            if kind == "command":
+                if command_id == CMD_REMEMBER:
+                    return chat_reply(body, cmd_remember(state, text))
+                if command_id == CMD_ANALYZE:
+                    return chat_reply(body, cmd_analyze())
+                if command_id == CMD_STATUS:
+                    return chat_reply(body, cmd_status(state))
+                return chat_reply(body, f"Unbekanntes Command (ID {command_id}).")
+            if kind == "message" and text:
+                return chat_reply(body, answer_chat(state, text))
+            return chat_reply(body, "Stell mir eine Frage zu den Logs — oder nutze /remember, /analyze, /status.")
         except Exception as e:
-            print(f"Chat answer failed: {e}")
-            return json.dumps({"text": f"Da ging etwas schief: {e}"})
+            print(f"Chat handling failed: {e}")
+            return chat_reply(body, f"Da ging etwas schief: {e}")
 
+    state = load_state()
     # Scheduled mode: per-service anomaly check, archive, advance cursor.
     combined_reports = []
     for service in SERVICES:
