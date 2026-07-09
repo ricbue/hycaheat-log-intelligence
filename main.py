@@ -280,16 +280,54 @@ def _verify_chat_request(request):
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         return False
+    token = auth[len("Bearer "):]
+    req = google_auth_requests.Request()
+
+    # New add-on-style deliveries (UA "Google-gsuiteaddons") are signed with
+    # Google's standard OIDC keys and sent by the add-ons service agent;
+    # audience+issuer alone would accept ANY Google-minted token with our
+    # project number as audience, so the sender email is allowlisted.
+    allowed_senders = {
+        CHAT_ISSUER,
+        f"service-{CHAT_AUDIENCE}@gcp-sa-gsuiteaddons.iam.gserviceaccount.com",
+    }
+    # Add-on-style deliveries set aud to the endpoint URL, legacy events to
+    # the project number — accept both, but only from allowlisted senders.
+    allowed_audiences = {CHAT_AUDIENCE, f"https://{request.host}"}
+    try:
+        # audience=None skips the built-in check; aud is validated manually
+        # against the allowed set above.
+        claims = id_token.verify_oauth2_token(token, req)
+        aud = claims.get("aud", "").rstrip("/")
+        if aud not in allowed_audiences:
+            print(f"Chat token with unexpected audience: {aud}")
+        elif claims.get("email") in allowed_senders and claims.get("email_verified", True):
+            return True
+        else:
+            print(f"Chat token from unexpected sender: {claims.get('email')} (iss {claims.get('iss')})")
+    except Exception as e:
+        print(f"OIDC-key verification failed, trying legacy Chat certs: {e}")
+
+    # Legacy event format: signed with the Chat system account's x509 certs.
     try:
         claims = id_token.verify_token(
-            auth[len("Bearer "):],
-            google_auth_requests.Request(),
+            token,
+            req,
             audience=CHAT_AUDIENCE,
             certs_url=CHAT_CERTS_URL,
         )
         return claims.get("iss") == CHAT_ISSUER or claims.get("email") == CHAT_ISSUER
     except Exception as e:
-        print(f"Chat token verification failed: {e}")
+        # Log the (unverified!) claims so the sender allowlist can be
+        # extended precisely — diagnostics only, never used for auth.
+        try:
+            import base64
+            payload = token.split(".")[1]
+            unverified = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+            print(f"Chat token verification failed: {e} | unverified claims: "
+                  f"iss={unverified.get('iss')} email={unverified.get('email')} aud={unverified.get('aud')}")
+        except Exception:
+            print(f"Chat token verification failed: {e}")
         return False
 
 @functions_framework.http
