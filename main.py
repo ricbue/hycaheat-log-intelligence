@@ -145,32 +145,51 @@ def analyze_with_claude(service_name, processed_logs, stats, service_state, user
     
     TASK:
     1. If user sent a message, answer it using the logs. Be technical and detailed.
-    2. Check for SEVERE operational problems only. NOTEWORTHY is TRUE only if
+    2. Check for SEVERE operational problems only. 'noteworthy' is true only if
        the service looks down or unreachable, requests are failing at a high
        rate (sustained 5xx), or there are clear signs of attack/abuse.
        New crawlers, isolated 404s, traffic shifts, and other curiosities are
        NOT noteworthy — never alert on them; they belong in the weekly digest.
-    3. Update the 'Baseline Summary' based on current logs and user feedback.
+    3. Update the baseline summary based on current logs and user feedback.
        Fold non-severe observations (new bots, recurring 404s, traffic trends)
        into it so the weekly digest can report them.
-
-    FORMAT:
-    --- SECTION_BREAK ---
-    NOTEWORTHY: [TRUE/FALSE]
-    --- SECTION_BREAK ---
-    [Your report/response for Google Chat. Answer user directly if they asked.]
-    --- SECTION_BREAK ---
-    [Updated Baseline Summary]
     """
     headers = {"x-api-key": CLAUDE_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
-    data = {"model": "claude-sonnet-5", "max_tokens": 2048, "messages": [{"role": "user", "content": prompt}]}
+    data = {
+        "model": "claude-sonnet-5",
+        # 8192: adaptive thinking (default on this model) plus report and a
+        # growing baseline share this budget — 2048 truncated the JSON mid-string.
+        "max_tokens": 8192,
+        # Structured output: the API guarantees the response is valid JSON
+        # matching this schema — no text parsing, no fail-open fallback.
+        "output_config": {
+            "format": {
+                "type": "json_schema",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "noteworthy": {"type": "boolean", "description": "True only for severe operational problems (service down, sustained 5xx, attack/abuse)"},
+                        "report": {"type": "string", "description": "Report/response for Google Chat. Answer the user directly if they asked."},
+                        "updated_baseline": {"type": "string", "description": "Updated baseline summary"},
+                    },
+                    "required": ["noteworthy", "report", "updated_baseline"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "messages": [{"role": "user", "content": prompt}],
+    }
     response = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json=data)
     res_json = response.json()
-    full_text = "".join([b["text"] for b in res_json.get("content", []) if b["type"] == "text"])
-    parts = full_text.split("--- SECTION_BREAK ---")
-    if len(parts) >= 4:
-        return "TRUE" in parts[1].upper(), parts[2].strip(), parts[3].strip()
-    return True, full_text, service_state['baseline_summary']
+    full_text = "".join(b["text"] for b in res_json.get("content", []) if b["type"] == "text")
+    try:
+        result = json.loads(full_text)
+        return bool(result["noteworthy"]), result["report"], result["updated_baseline"]
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        # Fail closed: severe-only alert channel — never spam the space on a
+        # parse failure; keep the old baseline so nothing is lost.
+        print(f"Unexpected Claude response for {service_name}: {e} | {full_text[:300]}")
+        return False, full_text, service_state['baseline_summary']
 
 def collect_weekly_stats(service_name, days=7):
     """Aggregate the raw-log archive (written by the hourly runs) for the
