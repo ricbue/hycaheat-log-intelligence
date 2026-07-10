@@ -26,8 +26,20 @@ ANALYZE_JOB = os.getenv("ANALYZE_JOB", f"projects/{PROJECT_ID}/locations/europe-
 CHAT_ISSUER = "chat@system.gserviceaccount.com"
 CHAT_CERTS_URL = f"https://www.googleapis.com/service_accounts/v1/metadata/x509/{CHAT_ISSUER}"
 
-SERVICES = ["hycaheat-website-prod", "hycaheat-configurator-prod", "tco-frontend-prod", "tco-backend-prod"]
-LLM_BOTS = ["GPTBot", "ClaudeBot", "Googlebot", "CCBot", "PerplexityBot", "OAI-SearchBot", "Applebot", "Bytespider"]
+# service -> GCP project hosting it. The TCO sim (tco.hyca.app) moved to
+# project "hyboid"; the identically named tco-* services in the main
+# project were shut down.
+SERVICES = {
+    "hycaheat-website-prod": PROJECT_ID,
+    "hycaheat-configurator-prod": PROJECT_ID,
+    "tco-frontend-prod": "hyboid",
+    "tco-backend-prod": "hyboid",
+}
+LLM_BOTS = ["GPTBot", "ClaudeBot", "Googlebot", "CCBot", "PerplexityBot", "OAI-SearchBot", "Applebot", "Bytespider",
+            # user-triggered AI fetchers — an AI product retrieving a page for a live answer
+            "ChatGPT-User", "Claude-User", "Claude-Web", "GoogleAgent-URLContext", "Perplexity-User", "Meta-ExternalAgent", "DuckAssistBot"]
+# GEO files whose access we track per user agent (only served by the website)
+GEO_FILES = ["llms.txt", "facts.md"]
 
 def load_state():
     try:
@@ -52,7 +64,7 @@ def save_state(state):
         print(f"Error saving state to GCS: {e}")
 
 def get_logs(service_name, lookback_hours=24, start_from=None):
-    client = cloud_logging.Client(project=PROJECT_ID)
+    client = cloud_logging.Client(project=SERVICES.get(service_name, PROJECT_ID))
     if start_from:
         try:
             start_time = datetime.fromisoformat(start_from.replace("Z", "+00:00"))
@@ -116,7 +128,8 @@ def preprocess_logs(logs):
             if bot.lower() in ua.lower():
                 stats["bot_hits"][bot] += 1
                 is_bot = True; break
-        if is_bot or (status and status >= 400):
+        is_geo_file = any(gf in url for gf in GEO_FILES)
+        if is_bot or is_geo_file or (status and status >= 400):
             processed.append({"t": entry.get("timestamp"), "s": status, "u": url, "ua": ua})
     return processed, stats
 
@@ -132,9 +145,15 @@ def analyze_with_claude(service_name, processed_logs, stats, service_state, user
     
     TASK:
     1. If user sent a message, answer it using the logs. Be technical and detailed.
-    2. Identify NEW anomalies.
+    2. Check for SEVERE operational problems only. NOTEWORTHY is TRUE only if
+       the service looks down or unreachable, requests are failing at a high
+       rate (sustained 5xx), or there are clear signs of attack/abuse.
+       New crawlers, isolated 404s, traffic shifts, and other curiosities are
+       NOT noteworthy — never alert on them; they belong in the weekly digest.
     3. Update the 'Baseline Summary' based on current logs and user feedback.
-    
+       Fold non-severe observations (new bots, recurring 404s, traffic trends)
+       into it so the weekly digest can report them.
+
     FORMAT:
     --- SECTION_BREAK ---
     NOTEWORTHY: [TRUE/FALSE]
@@ -152,6 +171,77 @@ def analyze_with_claude(service_name, processed_logs, stats, service_state, user
     if len(parts) >= 4:
         return "TRUE" in parts[1].upper(), parts[2].strip(), parts[3].strip()
     return True, full_text, service_state['baseline_summary']
+
+def collect_weekly_stats(service_name, days=7):
+    """Aggregate the raw-log archive (written by the hourly runs) for the
+    last `days` days — full data, unlike the 500-entry live-query cap."""
+    stats = {"total": 0, "daily": {}, "status_codes": {}, "bot_hits": {bot: 0 for bot in LLM_BOTS}, "error_paths": {}, "geo_file_hits": {}}
+    try:
+        client = storage.Client(project=PROJECT_ID)
+        bucket = client.lookup_bucket(STATE_BUCKET)
+        if not bucket:
+            return stats
+        today = datetime.now(timezone.utc).date()
+        for d in range(days):
+            day = today - timedelta(days=d)
+            for blob in bucket.list_blobs(prefix=f"logs/{service_name}/{day.strftime('%Y/%m/%d')}/"):
+                for line in blob.download_as_text().splitlines():
+                    try:
+                        hr = json.loads(line).get("httpRequest") or {}
+                    except (json.JSONDecodeError, AttributeError):
+                        continue
+                    status, ua, url = hr.get("status"), hr.get("userAgent") or "", hr.get("requestUrl") or ""
+                    stats["total"] += 1
+                    stats["daily"][day.isoformat()] = stats["daily"].get(day.isoformat(), 0) + 1
+                    stats["status_codes"][str(status)] = stats["status_codes"].get(str(status), 0) + 1
+                    for bot in LLM_BOTS:
+                        if bot.lower() in ua.lower():
+                            stats["bot_hits"][bot] += 1; break
+                    if status and status >= 400:
+                        key = f"{status} {url.split('?')[0]}"
+                        stats["error_paths"][key] = stats["error_paths"].get(key, 0) + 1
+                    for gf in GEO_FILES:
+                        if gf in url:
+                            hits = stats["geo_file_hits"].setdefault(gf, {})
+                            agent = (ua[:80] or "unknown")
+                            hits[agent] = hits.get(agent, 0) + 1
+                            break
+    except Exception as e:
+        print(f"Error collecting weekly stats for {service_name}: {e}")
+    stats["error_paths"] = dict(sorted(stats["error_paths"].items(), key=lambda kv: -kv[1])[:15])
+    stats["bot_hits"] = {b: c for b, c in stats["bot_hits"].items() if c}
+    return stats
+
+def weekly_digest(state):
+    """Compose the weekly overview from archive stats + accumulated baselines
+    and post it to the Chat space unconditionally."""
+    sections = []
+    for service in SERVICES:
+        stats = collect_weekly_stats(service)
+        baseline = state["services"].get(service, {}).get("baseline_summary", "No baseline.")
+        sections.append(f"### {service}\nWEEKLY STATS (7 Tage, aus dem Log-Archiv): {json.dumps(stats)}\nBASELINE NOTES (von den stündlichen Checks gepflegt): {baseline}")
+    prompt = (
+        "You are LogBot, the log-analysis assistant for hycaheat.com and the "
+        "TCO simulator tco.hyca.app (tco-frontend-prod / tco-backend-prod, "
+        "GCP project 'hyboid').\n\n"
+        + "\n\n".join(sections)
+        + "\n\nSchreibe die Wochenübersicht für den Google-Chat-Space auf Deutsch "
+        "(Plain Text, *fett* erlaubt, keine Markdown-Tabellen). Pro Service kurz: "
+        "Traffic-Niveau und -Trend, Fehlerbild (welche 404/5xx relevant sind, was "
+        "Rauschen ist), sonstige Auffälligkeiten. Kompakt und lesbar — ein Digest, "
+        "kein Daten-Dump.\n"
+        "Crawler-/Bot-Aktivität nur für hycaheat-website-prod berichten (für die "
+        "anderen Services irrelevant). Dort einen eigenen GEO-Abschnitt: Zugriffe "
+        "auf llms.txt und facts.md (geo_file_hits) mit User-Agents ausweisen und "
+        "dabei echte AI-Crawler/-Agents (GPTBot, ClaudeBot, PerplexityBot, "
+        "GoogleAgent-URLContext, ChatGPT-User …) klar von SEO-Scannern und "
+        "Monitoring-Tools (BuiltWith, TheWebReport, PTST, curl …) trennen."
+    )
+    headers = {"x-api-key": CLAUDE_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
+    data = {"model": "claude-sonnet-5", "max_tokens": 2048, "messages": [{"role": "user", "content": prompt}]}
+    response = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json=data)
+    digest = "".join(b["text"] for b in response.json().get("content", []) if b["type"] == "text")
+    requests.post(CHAT_WEBHOOK_URL, json={"text": "📊 *Wochenübersicht Logs*\n\n" + digest})
 
 def answer_chat(state, user_message):
     """Answer a Google Chat question with ONE Claude call across all services.
@@ -176,7 +266,9 @@ def answer_chat(state, user_message):
 
     prompt = (
         "You are LogBot, the log-analysis assistant for hycaheat.com "
-        "(Cloud Run services behind a GCP load balancer).\n\n"
+        "(Cloud Run services behind a GCP load balancer) and the TCO "
+        "simulator at tco.hyca.app (tco-frontend-prod / tco-backend-prod, "
+        "hosted in the separate GCP project 'hyboid').\n\n"
         + "\n\n".join(sections)
         + "\n\nWindow: last 24 hours, up to 500 most recent requests per service."
         + f"\n\nUSER QUESTION: '{user_message}'\n\n"
@@ -212,7 +304,7 @@ def cmd_analyze():
     try:
         from google.cloud import scheduler_v1
         scheduler_v1.CloudSchedulerClient().run_job(name=ANALYZE_JOB)
-        return "Analyse gestartet — der Bericht kommt in ~2 Minuten in den Space (falls es Auffälligkeiten gibt)."
+        return "Analyse gestartet — eine Meldung kommt nur bei gravierenden Problemen in den Space (Routine-Beobachtungen landen in der Wochenübersicht)."
     except Exception as e:
         print(f"cmd_analyze failed: {e}")
         return f"Konnte den Analyse-Job nicht starten: {e}"
@@ -373,7 +465,14 @@ def log_intelligence_webhook(request):
             return chat_reply(body, f"Da ging etwas schief: {e}")
 
     state = load_state()
-    # Scheduled mode: per-service anomaly check, archive, advance cursor.
+    if (body or {}).get("mode") == "weekly":
+        # Weekly digest: read-only overview from the archive, always posted.
+        weekly_digest(state)
+        return "OK", 200
+
+    # Scheduled mode (hourly): per-service check, archive, advance cursor.
+    # Posts to the space ONLY on severe problems — routine observations
+    # accumulate in the baselines and surface in the weekly digest.
     combined_reports = []
     for service in SERVICES:
         s_state = state["services"].get(service, {"last_timestamp": None, "baseline_summary": "No baseline established yet.", "human_instructions": ""})

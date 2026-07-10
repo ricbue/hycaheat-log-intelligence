@@ -2,6 +2,9 @@
 
 # Configuration
 PROJECT_ID="premium-gear-486210-f2"
+# Separate project hosting the TCO simulator (tco.hyca.app) — the function
+# reads its Cloud Run logs cross-project.
+TCO_PROJECT_ID="hyboid"
 REGION="europe-west10"
 FUNCTION_NAME="log-intelligence"
 ENTRY_POINT="log_intelligence_webhook"
@@ -66,6 +69,18 @@ EOF
         --schedule="0 * * * *" --uri="$FUNCTION_URL" \
         --http-method=POST --message-body="$SCHEDULER_BODY" \
         --update-headers "Content-Type=application/json"
+    echo "⏰ Creating weekly digest Cloud Scheduler job (Monday 07:00 Berlin)..."
+    WEEKLY_BODY="{\"token\": \"$ANALYZE_TOKEN\", \"mode\": \"weekly\"}"
+    gcloud scheduler jobs create http log-intelligence-weekly \
+      --project=$PROJECT_ID --location=$SCHEDULER_REGION \
+      --schedule="0 7 * * 1" --time-zone="Europe/Berlin" --uri="$FUNCTION_URL" \
+      --http-method=POST --message-body="$WEEKLY_BODY" \
+      --headers "Content-Type=application/json" 2>/dev/null \
+      || gcloud scheduler jobs update http log-intelligence-weekly \
+        --project=$PROJECT_ID --location=$SCHEDULER_REGION \
+        --schedule="0 7 * * 1" --time-zone="Europe/Berlin" --uri="$FUNCTION_URL" \
+        --http-method=POST --message-body="$WEEKLY_BODY" \
+        --update-headers "Content-Type=application/json"
   else
     echo "   ⚠️ Function not deployed yet — run ./deploy.sh first, then --setup again."
   fi
@@ -74,6 +89,12 @@ EOF
     --member="serviceAccount:$PROJECT_NUMBER-compute@developer.gserviceaccount.com" \
     --role="roles/cloudscheduler.jobRunner" --condition=None --quiet >/dev/null \
     && echo "   ok" || echo "   ⚠️ IAM binding failed — /analyze will not work."
+
+  echo "🔑 Allowing the function to read TCO-sim logs in project $TCO_PROJECT_ID..."
+  gcloud projects add-iam-policy-binding $TCO_PROJECT_ID \
+    --member="serviceAccount:$PROJECT_NUMBER-compute@developer.gserviceaccount.com" \
+    --role="roles/logging.viewer" --condition=None --quiet >/dev/null \
+    && echo "   ok" || echo "   ⚠️ IAM binding failed — tco-* services will show no logs."
 
   echo "✅ Setup finished."
   exit 0
