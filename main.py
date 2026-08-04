@@ -1,5 +1,6 @@
 import os
 import json
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import requests
 from google.auth.transport import requests as google_auth_requests
@@ -138,6 +139,82 @@ def preprocess_logs(logs):
             # document a catch-all serves for any probed path (200 or 206).
             processed.append({"t": entry.get("timestamp"), "s": status, "b": hr.get("responseSize"), "u": url, "ua": ua})
     return processed, stats
+
+def update_daily_stats(service_name, logs):
+    """Fold the hourly batch into per-day aggregates:
+    gs://<bucket>/stats/<service>/YYYY-MM-DD.json.
+
+    A few hundred bytes per day — cheap, permanent (the lifecycle rule only
+    rotates logs/) LLM context for chat questions spanning weeks, which the
+    24h live window cannot answer. Entries are bucketed by their own
+    timestamp, not the run time; the cursor guarantees no batch overlaps,
+    so merging is plain addition."""
+    by_day = {}
+    for entry in logs:
+        day = (entry.get("timestamp") or "")[:10]
+        if not day:
+            continue
+        hr = entry.get("httpRequest", {})
+        status, ua, url = hr.get("status"), hr.get("userAgent") or "", hr.get("requestUrl") or ""
+        d = by_day.setdefault(day, {"total": 0, "status_codes": {}, "bot_hits": {}, "geo_file_hits": 0})
+        d["total"] += 1
+        d["status_codes"][str(status)] = d["status_codes"].get(str(status), 0) + 1
+        for bot in LLM_BOTS:
+            if bot.lower() in ua.lower():
+                d["bot_hits"][bot] = d["bot_hits"].get(bot, 0) + 1
+                break
+        if any(gf in url for gf in GEO_FILES):
+            d["geo_file_hits"] += 1
+    if not by_day:
+        return
+    try:
+        client = storage.Client(project=PROJECT_ID)
+        bucket = client.lookup_bucket(STATE_BUCKET)
+        if not bucket:
+            return
+        for day, add in by_day.items():
+            blob = bucket.blob(f"stats/{service_name}/{day}.json")
+            cur = json.loads(blob.download_as_text()) if blob.exists() else {"total": 0, "status_codes": {}, "bot_hits": {}, "geo_file_hits": 0}
+            cur["total"] += add["total"]
+            for k, v in add["status_codes"].items():
+                cur["status_codes"][k] = cur["status_codes"].get(k, 0) + v
+            for k, v in add["bot_hits"].items():
+                cur["bot_hits"][k] = cur["bot_hits"].get(k, 0) + v
+            cur["geo_file_hits"] = cur.get("geo_file_hits", 0) + add["geo_file_hits"]
+            blob.upload_from_string(json.dumps(cur))
+    except Exception as e:
+        print(f"Error updating daily stats for {service_name}: {e}")
+
+def load_daily_stats(service_name, days=21):
+    """The last `days` day-aggregates as {date: stats}, oldest first."""
+    out = {}
+    try:
+        client = storage.Client(project=PROJECT_ID)
+        bucket = client.lookup_bucket(STATE_BUCKET)
+        if not bucket:
+            return out
+        for blob in sorted(bucket.list_blobs(prefix=f"stats/{service_name}/"), key=lambda b: b.name)[-days:]:
+            try:
+                out[blob.name.rsplit("/", 1)[1].removesuffix(".json")] = json.loads(blob.download_as_text())
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"Error loading daily stats for {service_name}: {e}")
+    return out
+
+def load_recent_digests(n=2):
+    """The most recent archived weekly digests as [(date, text)], newest first."""
+    out = []
+    try:
+        client = storage.Client(project=PROJECT_ID)
+        bucket = client.lookup_bucket(STATE_BUCKET)
+        if not bucket:
+            return out
+        for blob in sorted(bucket.list_blobs(prefix="digests/"), key=lambda b: b.name)[-n:][::-1]:
+            out.append((blob.name.rsplit("/", 1)[1].removesuffix(".md"), blob.download_as_text()))
+    except Exception as e:
+        print(f"Error loading digests: {e}")
+    return out
 
 def analyze_with_claude(service_name, processed_logs, stats, service_state, user_message=None):
     mode = f"CHAT MODE. User said: '{user_message}'" if user_message else "SCHEDULED MODE. Perform anomaly check."
@@ -305,18 +382,30 @@ def answer_chat(state, user_message):
     scheduler cursor, archive logs, or rewrite baselines (except appending
     an explicit standing instruction).
     """
-    sections = []
-    for service in SERVICES:
-        s_state = state["services"].get(service, {"baseline_summary": "No baseline established yet.", "human_instructions": ""})
+    # All I/O in parallel: the sequential version took 27-29 s and kept
+    # hitting Google Chat's ~30 s synchronous reply deadline.
+    def gather(service):
         logs, _ = get_logs(service, lookback_hours=24)
         processed, stats = preprocess_logs(logs)
+        return service, processed, stats, load_daily_stats(service)
+
+    with ThreadPoolExecutor(max_workers=len(SERVICES) + 1) as pool:
+        digests_future = pool.submit(load_recent_digests)
+        gathered = list(pool.map(gather, SERVICES))
+        digests = digests_future.result()
+
+    sections = []
+    for service, processed, stats, daily in gathered:
+        s_state = state["services"].get(service, {"baseline_summary": "No baseline established yet.", "human_instructions": ""})
         sections.append(
             f"### Service: {service}\n"
             f"BASELINE: {s_state['baseline_summary']}\n"
             f"STANDING INSTRUCTIONS: {s_state.get('human_instructions') or 'None'}\n"
-            f"STATS: {json.dumps(stats)}\n"
-            f"LOG SAMPLE (bots, errors, GEO files + a few lines per status code): {json.dumps(processed[:60])}"
+            f"LAST-24H STATS: {json.dumps(stats)}\n"
+            f"LAST-24H LOG SAMPLE (bots, errors, GEO files + a few lines per status code): {json.dumps(processed[:30])}\n"
+            f"DAILY STATS (per-day aggregates, last ~3 weeks): {json.dumps(daily)}"
         )
+    digest_block = "\n\n".join(f"--- Wochenübersicht {d} ---\n{t}" for d, t in digests) or "None archived yet."
 
     prompt = (
         "You are LogBot, the log-analysis assistant for hycaheat.com "
@@ -324,12 +413,16 @@ def answer_chat(state, user_message):
         "simulator at tco.hyca.app (tco-frontend-prod / tco-backend-prod, "
         "hosted in the separate GCP project 'hyboid').\n\n"
         + "\n\n".join(sections)
-        + "\n\nWindow: last 24 hours, up to 500 most recent requests per service."
+        + "\n\nRECENT WEEKLY DIGESTS:\n" + digest_block
         + f"\n\nUSER QUESTION: '{user_message}'\n\n"
-        "Answer the question directly and concisely for a Google Chat message "
+        "Pick the data source matching the question's time horizon: DAILY "
+        "STATS and the WEEKLY DIGESTS for anything spanning days or weeks "
+        "(trends, bot/crawler activity over time); the raw LAST-24H sample "
+        "(up to 500 most recent requests) only for what is happening right "
+        "now. Answer directly and concisely for a Google Chat message "
         "(plain text, *bold* allowed, no markdown tables). Only mention services "
         "relevant to the question. Base claims strictly on the data above; say "
-        "so when the window or sample does not contain the answer."
+        "so when the available windows do not contain the answer."
     )
     headers = {"x-api-key": CLAUDE_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
     data = {"model": "claude-sonnet-5", "max_tokens": 1024, "messages": [{"role": "user", "content": prompt}]}
@@ -533,6 +626,7 @@ def log_intelligence_webhook(request):
         logs, latest_ts = get_logs(service, lookback_hours=24, start_from=s_state["last_timestamp"])
         if not logs: continue
         archive_logs(service, logs)
+        update_daily_stats(service, logs)
         processed, stats = preprocess_logs(logs)
         is_noteworthy, report, new_baseline = analyze_with_claude(service, processed, stats, s_state)
         state["services"][service].update({"last_timestamp": latest_ts, "baseline_summary": new_baseline})

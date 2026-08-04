@@ -33,8 +33,8 @@ Cloud Run services                    GCP project premium-gear-486210-f2
    claude-sonnet-5              GCS state bucket
    (structured output)            state/   intelligence_state.json
            │                      logs/    raw JSONL archive (90d rotation)
-           ▼                      digests/ weekly digests (kept forever)
-   Google Chat space
+           ▼                      stats/   per-day aggregates (kept forever)
+   Google Chat space              digests/ weekly digests (kept forever)
    (webhook for reports, Chat app for dialogue)
 ```
 
@@ -49,7 +49,11 @@ Every hour, per service:
    would silently return the *oldest* entries of the window).
 2. **Archive** the raw batch as JSONL to
    `gs://<bucket>/logs/<service>/YYYY/MM/DD/HHMMSS.jsonl`. A bucket
-   lifecycle rule deletes archive objects after 90 days.
+   lifecycle rule deletes archive objects after 90 days. The batch is also
+   folded into **per-day aggregates** (`stats/<service>/YYYY-MM-DD.json`:
+   total, status histogram, per-bot hits, GEO-file hits) — a few hundred
+   bytes per day, kept forever, bucketed by entry timestamp; the cursor
+   guarantees batches never overlap, so merging is plain addition.
 3. **Preprocess deterministically** into two artifacts:
    - `STATS`: total count, status-code histogram, per-bot hit counters for
      ~15 AI crawlers/fetchers (GPTBot, ClaudeBot, PerplexityBot,
@@ -104,9 +108,15 @@ long-term record of how traffic and error patterns develop).
 
 The same function is registered as a Google Chat app ("LogBot"). Mentions
 are answered synchronously (Chat allows ~30 s, so one Claude call spans all
-services; a full per-service analysis takes ~100 s and is therefore
-delegated to the Scheduler job via `/analyze`). Chat access is read-only:
-it never advances cursors, archives logs, or rewrites baselines. Commands:
+services and all per-service I/O runs in a thread pool — sequential
+fetching took 27–29 s and kept grazing the deadline; a full per-service
+analysis takes ~100 s and is therefore delegated to the Scheduler job via
+`/analyze`). The answer prompt layers three time horizons and tells the
+model to pick by the question's scope: the raw 24 h sample for "right
+now", the per-day aggregates (~3 weeks) for trends like crawler activity,
+and the archived weekly digests for narrative context. Chat access is
+read-only: it never advances cursors, archives logs, or rewrites
+baselines. Commands:
 `/remember` (append a standing instruction), `/analyze` (trigger the hourly
 job), `/status` (cursors + instruction counts, no LLM call).
 

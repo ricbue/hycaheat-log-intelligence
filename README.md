@@ -15,7 +15,9 @@ alerting — and is written to be shareable on its own.
 
 - **LLM bot tracking:** GPTBot, ClaudeBot, PerplexityBot, Googlebot, …
 - **Chat with your logs:** mention the bot in Google Chat ("welche AI-Crawler
-  waren heute da?") — answers from the last 24 h of request logs.
+  waren heute da?") — answers from the last 24 h of raw request logs, per-day
+  aggregates (~3 weeks, for trend questions like "wie war die Bot-Aktivität
+  die letzten Wochen?") and the archived weekly digests.
 - **Slash commands** (everything else is treated as a chat question):
   `/remember <text>` stores a standing instruction for future analyses
   (persisted in the GCS state; unlike baselines, never rewritten by the
