@@ -1,8 +1,11 @@
 # Log Intelligence for Hyca Heat
 
-Automated monitoring and analysis of the Cloud Run request logs (hycaheat.com
-& friends) using the Claude API — plus an interactive Google Chat bot to ask
-questions about the logs.
+Automated monitoring and analysis of the Cloud Run request logs using the
+Claude API — plus an interactive Google Chat bot to ask questions about the
+logs. Monitored services: hycaheat-website-prod and
+hycaheat-configurator-prod (project premium-gear-486210-f2) plus the TCO
+simulator tco.hyca.app (tco-frontend-prod / tco-backend-prod, read
+cross-project from GCP project `hyboid`).
 
 ## Features
 
@@ -10,11 +13,20 @@ questions about the logs.
 - **Chat with your logs:** mention the bot in Google Chat ("welche AI-Crawler
   waren heute da?") — answers from the last 24 h of request logs.
 - **Slash commands** (everything else is treated as a chat question):
-  `/remember <text>` stores a standing instruction for future analyses,
+  `/remember <text>` stores a standing instruction for future analyses
+  (persisted in the GCS state; unlike baselines, never rewritten by the
+  model — e.g. the known-benign list of scanner patterns),
   `/analyze` triggers the Scheduler job (report arrives via webhook),
   `/status` shows cursors and instruction counts without a Claude call.
-- **Scheduled anomaly reports:** hourly Cloud Scheduler run per service;
-  posts to Google Chat only when noteworthy.
+- **Hourly anomaly checks:** Cloud Scheduler run per service; posts to
+  Google Chat ONLY when immediate action is required (service down,
+  sustained user-facing 5xx, an attack actually succeeding). Everything
+  else — new crawlers, 404s, traffic shifts, scanner noise — accumulates
+  in the baselines for the weekly digest.
+- **Weekly digest:** Mondays 07:00 Europe/Berlin, posted unconditionally
+  (in German) — traffic level & trend, error picture, crawler/GEO activity
+  per service, aggregated from the full raw-log archive rather than the
+  500-entry live-query cap.
 - **Raw-log archive with rotation:** every scheduled run appends the batch as
   JSONL to `gs://<bucket>/logs/<service>/YYYY/MM/DD/HHMMSS.jsonl`; a GCS
   lifecycle rule deletes archive objects after 90 days (configurable).
@@ -29,7 +41,9 @@ questions about the logs.
 
 ```bash
 ./deploy.sh             # deploy the Cloud Function (reads secrets from .env)
-./deploy.sh --setup     # one-time: bucket, lifecycle rotation, hourly scheduler
+./deploy.sh --setup     # one-time: bucket, lifecycle rule, hourly + weekly
+                        # scheduler jobs, IAM (jobRunner for /analyze,
+                        # cross-project logging.viewer on hyboid)
 ./deploy.sh --snapshot  # copy the live GCS state into the repo (commit manually)
 ```
 
@@ -45,6 +59,8 @@ the scripts; GitHub push protection blocks pushes containing keys.
 - `LOG_RETENTION_DAYS` — archive rotation, deploy-time only (default 90)
 - `CHAT_AUDIENCE` — set automatically by deploy.sh (project number); enables
   verification of the Google-signed bearer token on Chat events
+- `ANALYZE_JOB` — set automatically by deploy.sh; full resource name of the
+  hourly Scheduler job that `/analyze` triggers
 
 ## Google Chat app (interactive bot)
 
