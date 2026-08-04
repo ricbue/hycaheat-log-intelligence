@@ -22,6 +22,17 @@ if [ -f .env ]; then
   source .env
   set +a
 fi
+# Manual state snapshot: ./deploy.sh --snapshot
+# Copies the live state (baselines, cursors, standing instructions) from GCS
+# into the repo so it can be committed as a versioned snapshot. Needs no
+# secrets, so it runs before the .env checks.
+if [ "$1" = "--snapshot" ]; then
+  echo "📸 Copying gs://$STATE_BUCKET/intelligence_state.json into the repo..."
+  gcloud storage cp "gs://$STATE_BUCKET/intelligence_state.json" intelligence_state.json
+  echo "✅ Snapshot updated — review & commit intelligence_state.json to version it."
+  exit 0
+fi
+
 : "${CLAUDE_API_KEY:?Set CLAUDE_API_KEY in the environment or .env}"
 : "${CHAT_WEBHOOK_URL:?Set CHAT_WEBHOOK_URL in the environment or .env}"
 : "${ANALYZE_TOKEN:?Set ANALYZE_TOKEN in .env (e.g. openssl rand -hex 24) — shared secret for the Scheduler trigger}"

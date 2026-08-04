@@ -25,8 +25,9 @@ questions about the logs.
 ## Deployment
 
 ```bash
-./deploy.sh           # deploy the Cloud Function (reads secrets from .env)
-./deploy.sh --setup   # one-time: bucket, lifecycle rotation, hourly scheduler
+./deploy.sh             # deploy the Cloud Function (reads secrets from .env)
+./deploy.sh --setup     # one-time: bucket, lifecycle rotation, hourly scheduler
+./deploy.sh --snapshot  # copy the live GCS state into the repo (commit manually)
 ```
 
 Secrets live in a local `.env` (gitignored, see `.env` keys below) — never in

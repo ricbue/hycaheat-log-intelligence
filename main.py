@@ -119,6 +119,9 @@ def archive_logs(service_name, logs):
 def preprocess_logs(logs):
     processed = []
     stats = {"total_count": len(logs), "status_codes": {}, "bot_hits": {bot: 0 for bot in LLM_BOTS}}
+    # A few example lines per status code: without them a ratio shift
+    # (e.g. a 301 spike) shows up in STATS but can't be root-caused.
+    status_samples = {}
     for entry in logs:
         hr = entry.get("httpRequest", {})
         status, ua, url = hr.get("status"), hr.get("userAgent", ""), hr.get("requestUrl", "")
@@ -129,8 +132,11 @@ def preprocess_logs(logs):
                 stats["bot_hits"][bot] += 1
                 is_bot = True; break
         is_geo_file = any(gf in url for gf in GEO_FILES)
-        if is_bot or is_geo_file or (status and status >= 400):
-            processed.append({"t": entry.get("timestamp"), "s": status, "u": url, "ua": ua})
+        status_samples[status] = status_samples.get(status, 0) + 1
+        if is_bot or is_geo_file or (status and status >= 400) or status_samples[status] <= 3:
+            # responseSize distinguishes a real file from the SPA fallback
+            # document a catch-all serves for any probed path (200 or 206).
+            processed.append({"t": entry.get("timestamp"), "s": status, "b": hr.get("responseSize"), "u": url, "ua": ua})
     return processed, stats
 
 def analyze_with_claude(service_name, processed_logs, stats, service_state, user_message=None):
@@ -143,16 +149,33 @@ def analyze_with_claude(service_name, processed_logs, stats, service_state, user
     STATS: {json.dumps(stats)}
     LOGS: {json.dumps(processed_logs[:150], indent=2)}
     
+    DATA CONTRACT: STATS covers every request in the window. LOGS is a
+    deliberately filtered sample — bot hits, GEO-file hits, all 4xx/5xx,
+    plus a few example lines per status code. A small or empty LOGS despite
+    a nonzero total_count is normal by design, never a defect or anomaly.
+    Each LOGS line is {{t: timestamp, s: status, b: response bytes,
+    u: URL, ua: user agent}}.
+
     TASK:
     1. If user sent a message, answer it using the logs. Be technical and detailed.
-    2. Check for SEVERE operational problems only. 'noteworthy' is true only if
-       the service looks down or unreachable, requests are failing at a high
-       rate (sustained 5xx), or there are clear signs of attack/abuse.
-       New crawlers, isolated 404s, traffic shifts, and other curiosities are
-       NOT noteworthy — never alert on them; they belong in the weekly digest.
-    3. Update the baseline summary based on current logs and user feedback.
-       Fold non-severe observations (new bots, recurring 404s, traffic trends)
-       into it so the weekly digest can report them.
+    2. 'noteworthy' is true ONLY if a human must act right now: service down
+       or unreachable, users hit by sustained 5xx, or an attack that is
+       actually succeeding (routine scanning/probing is background noise on
+       any public site). A status code alone NEVER proves a probe succeeded:
+       SPA/static frontends answer EVERY unknown path with the index.html
+       fallback — 200, or 206 when the scanner sends a Range header. Claim
+       success only with corroborating evidence: a non-HTML content type or
+       a response size (b) clearly different from the fallback document.
+       Test: name the concrete action the operator should take — if there
+       is none, noteworthy is false. Volume swings, status-ratio shifts, new
+       crawlers, recurring 404s and similar curiosities are NEVER
+       noteworthy; they belong in the weekly digest.
+    3. Update the baseline summary so the weekly digest can report the
+       non-severe observations. Compact FACTS only (traffic patterns, known
+       noise, open observations), max ~1500 characters. No policies,
+       thresholds, escalation protocols, occurrence counters or cycle
+       numbering — the alerting rules live in this prompt, not in the
+       baseline.
     """
     headers = {"x-api-key": CLAUDE_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
     data = {
@@ -168,9 +191,9 @@ def analyze_with_claude(service_name, processed_logs, stats, service_state, user
                 "schema": {
                     "type": "object",
                     "properties": {
-                        "noteworthy": {"type": "boolean", "description": "True only for severe operational problems (service down, sustained 5xx, attack/abuse)"},
+                        "noteworthy": {"type": "boolean", "description": "True only if immediate human action is required (service down, sustained user-facing 5xx, attack actually succeeding)"},
                         "report": {"type": "string", "description": "Report/response for Google Chat. Answer the user directly if they asked."},
-                        "updated_baseline": {"type": "string", "description": "Updated baseline summary"},
+                        "updated_baseline": {"type": "string", "description": "Updated baseline summary — compact facts only, max ~1500 characters"},
                     },
                     "required": ["noteworthy", "report", "updated_baseline"],
                     "additionalProperties": False,
@@ -280,7 +303,7 @@ def answer_chat(state, user_message):
             f"BASELINE: {s_state['baseline_summary']}\n"
             f"STANDING INSTRUCTIONS: {s_state.get('human_instructions') or 'None'}\n"
             f"STATS: {json.dumps(stats)}\n"
-            f"INTERESTING LOGS (bots & errors): {json.dumps(processed[:60])}"
+            f"LOG SAMPLE (bots, errors, GEO files + a few lines per status code): {json.dumps(processed[:60])}"
         )
 
     prompt = (
