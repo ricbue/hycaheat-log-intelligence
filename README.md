@@ -18,6 +18,9 @@ questions about the logs.
 - **Raw-log archive with rotation:** every scheduled run appends the batch as
   JSONL to `gs://<bucket>/logs/<service>/YYYY/MM/DD/HHMMSS.jsonl`; a GCS
   lifecycle rule deletes archive objects after 90 days (configurable).
+- **Weekly digest archive:** every Monday digest is also stored as
+  `gs://<bucket>/digests/YYYY-MM-DD.md` (kept forever, unlike the raw logs) —
+  the long-term record of how traffic and error patterns develop.
 - **State in GCS:** baseline summaries, cursors and instructions live in
   `gs://<bucket>/intelligence_state.json` — Cloud Function filesystems are
   ephemeral.

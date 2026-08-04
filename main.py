@@ -284,6 +284,18 @@ def weekly_digest(state):
     response = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json=data)
     digest = "".join(b["text"] for b in response.json().get("content", []) if b["type"] == "text")
     requests.post(CHAT_WEBHOOK_URL, json={"text": "📊 *Wochenübersicht Logs*\n\n" + digest})
+    # Keep the digest beyond the Chat scroll-back: the raw-log archive
+    # rotates after 90 days, so these are the long-term trend record. The
+    # lifecycle rule only matches the logs/ prefix — digests/ is kept forever.
+    try:
+        client = storage.Client(project=PROJECT_ID)
+        bucket = client.lookup_bucket(STATE_BUCKET)
+        if bucket:
+            path = f"digests/{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.md"
+            bucket.blob(path).upload_from_string(digest, content_type="text/markdown")
+            print(f"Archived weekly digest to gs://{STATE_BUCKET}/{path}")
+    except Exception as e:
+        print(f"Error archiving weekly digest: {e}")
 
 def answer_chat(state, user_message):
     """Answer a Google Chat question with ONE Claude call across all services.
