@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-FileCopyrightText: © 2026 Hyca Heat GmbH
+# SPDX-License-Identifier: LicenseRef-HyCa-Proprietary
 
 # Configuration
 PROJECT_ID="premium-gear-486210-f2"

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: © 2026 Hyca Heat GmbH
+# SPDX-License-Identifier: LicenseRef-HyCa-Proprietary
+
 import os
 import json
 from concurrent.futures import ThreadPoolExecutor
@@ -288,7 +291,7 @@ def analyze_with_claude(service_name, processed_logs, stats, service_state, user
     except (json.JSONDecodeError, KeyError, TypeError) as e:
         # Fail closed: severe-only alert channel — never spam the space on a
         # parse failure; keep the old baseline so nothing is lost.
-        print(f"Unexpected Claude response for {service_name}: {e} | {full_text[:300]}")
+        print(f"Unexpected Claude response for {service_name}: {e} | stop_reason={res_json.get('stop_reason')} error={res_json.get('error')} | {full_text[:300]}")
         return False, full_text, service_state['baseline_summary']
 
 def collect_weekly_stats(service_name, days=7):
@@ -357,7 +360,9 @@ def weekly_digest(state):
         "Monitoring-Tools (BuiltWith, TheWebReport, PTST, curl …) trennen."
     )
     headers = {"x-api-key": CLAUDE_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
-    data = {"model": "claude-sonnet-5", "max_tokens": 2048, "messages": [{"role": "user", "content": prompt}]}
+    # 8192: adaptive thinking shares the budget with the digest text — see
+    # the same fix in analyze_with_claude/answer_chat.
+    data = {"model": "claude-sonnet-5", "max_tokens": 8192, "messages": [{"role": "user", "content": prompt}]}
     response = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json=data)
     digest = "".join(b["text"] for b in response.json().get("content", []) if b["type"] == "text")
     requests.post(CHAT_WEBHOOK_URL, json={"text": "📊 *Wochenübersicht Logs*\n\n" + digest})
@@ -425,10 +430,16 @@ def answer_chat(state, user_message):
         "so when the available windows do not contain the answer."
     )
     headers = {"x-api-key": CLAUDE_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
-    data = {"model": "claude-sonnet-5", "max_tokens": 1024, "messages": [{"role": "user", "content": prompt}]}
+    # 8192, not 1024: adaptive thinking (default on this model) shares the
+    # budget with the visible answer — on hard questions (multi-week trend
+    # summaries) thinking alone exceeded 1024, the response contained no
+    # text block, and the user saw the "Keine Antwort" fallback.
+    data = {"model": "claude-sonnet-5", "max_tokens": 8192, "messages": [{"role": "user", "content": prompt}]}
     response = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json=data)
     res_json = response.json()
     answer = "".join(b["text"] for b in res_json.get("content", []) if b["type"] == "text")
+    if not answer:
+        print(f"Empty chat answer: stop_reason={res_json.get('stop_reason')} error={res_json.get('error')} content_types={[b.get('type') for b in res_json.get('content') or []]}")
     return answer or "Keine Antwort erhalten — bitte noch einmal versuchen."
 
 # Slash commands — IDs must match the command configuration in the

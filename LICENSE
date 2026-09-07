@@ -1,0 +1,28 @@
+Copyright © 2026 Hyca Heat GmbH. All rights reserved.
+
+Hyca Heat GmbH, Handelsregister HRB 284603 B
+
+PROPRIETARY AND CONFIDENTIAL
+
+This repository and its contents — source code, documentation, configuration
+and all associated materials (the "Software") — are the confidential and
+proprietary property of Hyca Heat GmbH.
+
+No licence or other right in the Software is granted, whether expressly, by
+implication, by estoppel or otherwise. In particular, no permission is given
+to use, copy, reproduce, modify, merge, publish, distribute, sublicense, sell,
+disclose or create derivative works of the Software, in whole or in part,
+except under a separate written agreement signed by Hyca Heat GmbH.
+
+Access to this repository does not transfer ownership of, or any licence in,
+the Software. Anyone who obtains access without authorisation must not use the
+Software and should notify Hyca Heat GmbH.
+
+THIRD-PARTY COMPONENTS
+
+This repository incorporates third-party components, each of which remains
+under its own licence and is not covered by the terms above. A complete
+inventory is maintained in the hybo repository at
+docs/licenses_third_party.md.
+
+SPDX-License-Identifier: LicenseRef-HyCa-Proprietary
